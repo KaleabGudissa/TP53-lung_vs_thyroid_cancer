@@ -1,0 +1,12 @@
+# data
+data/raw/*
+*.maf
+*.gz
+*.tar.gz
+
+# env / build
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
