@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from lifelines import KaplanMeierFitter
+from lifelines import KaplanMeierFitter, CoxPHFitter
 from lifelines.statistics import logrank_test
 from scipy.stats import chi2_contingency, fisher_exact
 
@@ -77,6 +77,15 @@ def load_cbio_patient_clin(path: Path) -> pd.DataFrame:
         "os_months": pd.to_numeric(df.get("OS_MONTHS"), errors="coerce"),
         "os_event": df.get("OS_STATUS").apply(to_event)
     })
+    # optional covariates if present
+    if "AGE" in df.columns:
+        out["age"] = pd.to_numeric(df["AGE"], errors="coerce")
+    if "SEX" in df.columns:
+        out["sex"] = df["SEX"]
+    if "AJCC_PATHOLOGIC_STAGE" in df.columns:
+        out["stage"] = df["AJCC_PATHOLOGIC_STAGE"]
+    elif "PATHOLOGIC_STAGE" in df.columns:
+        out["stage"] = df["PATHOLOGIC_STAGE"]
     return out
 
 def tp53_status(mut_df: pd.DataFrame):
@@ -204,7 +213,7 @@ def main():
     plt.savefig(FIGS/"fig1_tp53_pct_luad_vs_thca.pdf")
     plt.close()
 
-    # 6) LUAD survival — KM + log-rank
+    # 6) LUAD survival — KM + log-rank + Cox (with encoding)
     clin_luad = load_cbio_patient_clin(luad_clin_p)
     km = clin_luad.merge(luad_status, on="patient_id", how="inner")
 
@@ -219,13 +228,12 @@ def main():
     g0 = km[km["tp53_mut"]==0]
 
     if len(g1) == 0 or len(g0) == 0:
-        # If a group is empty, skip KM to avoid errors
-        (TABLES/"table3_cox_summary.csv").write_text("KM skipped: one group empty.\n", encoding="utf-8")
+        (TABLES/"table3_cox_summary.csv").write_text("KM/Cox skipped: one group empty.\n", encoding="utf-8")
     else:
+        # KM + log-rank
         kmf0, kmf1 = KaplanMeierFitter(), KaplanMeierFitter()
         kmf0.fit(durations=g0["os_months"], event_observed=g0["os_event"], label=f"TP53 wild-type (n={len(g0)})")
         kmf1.fit(durations=g1["os_months"], event_observed=g1["os_event"], label=f"TP53 mutated (n={len(g1)})")
-
         res = logrank_test(g1["os_months"], g0["os_months"], event_observed_A=g1["os_event"], event_observed_B=g0["os_event"])
         chi2_lr, p_lr = float(res.test_statistic), float(res.p_value)
 
@@ -239,7 +247,41 @@ def main():
         plt.savefig(FIGS/"fig2_km_luad_tp53.pdf")
         plt.close()
 
-        # Optional: unadjusted Cox HR could be added later if you want
+        # Cox PH (encode categorical covariates to numeric and fit)
+        try:
+            cox_df = km[["os_months","os_event","tp53_mut"]].copy()
+
+            # age if present
+            if "age" in km.columns:
+                cox_df["age"] = pd.to_numeric(km["age"], errors="coerce")
+
+            # sex -> numeric (Female=0, Male=1)
+            if "sex" in km.columns:
+                cox_df["sex_num"] = km["sex"].astype(str).str.upper().map({"FEMALE":0, "MALE":1})
+
+            # stage -> ordinal 1..4 (handles IA/IB/IIIA etc.)
+            if "stage" in km.columns:
+                def stage_to_num(s):
+                    s = str(s).upper()
+                    if "IV" in s:   return 4
+                    if "III" in s:  return 3
+                    if "II" in s:   return 2
+                    if "I" in s:    return 1
+                    return np.nan
+                cox_df["stage_num"] = km["stage"].apply(stage_to_num)
+
+            # keep only numeric columns and drop rows with NA
+            num_cols = [c for c in cox_df.columns if c not in {"sex","stage"}]
+            cox_df = cox_df[num_cols].apply(pd.to_numeric, errors="coerce").dropna()
+
+            if len(cox_df) < 30:
+                (TABLES/"table3_cox_summary.csv").write_text(f"Cox skipped: not enough complete rows ({len(cox_df)}).\n", encoding="utf-8")
+            else:
+                cph = CoxPHFitter()
+                cph.fit(cox_df, duration_col="os_months", event_col="os_event")
+                cph.summary.reset_index().to_csv(TABLES/"table3_cox_summary.csv", index=False)
+        except Exception as e:
+            (TABLES/"table3_cox_summary.csv").write_text(f"Could not fit Cox model: {e}\n", encoding="utf-8")
 
     # 7) Minimal provenance README (UTF-8)
     (DOCS/"DATASET_README.txt").write_text(
@@ -260,6 +302,7 @@ Outputs:
 - Table2: chi-square + Fisher, OR, RR (95% CI)
 - Figure1: % TP53 (95% CI bars)
 - Figure2: KM (log-rank)
+- Table3: Cox PH (if possible)
 """,
         encoding="utf-8"
     )
@@ -271,7 +314,7 @@ Outputs:
     print(f"Chi-square: chi2={chi2:.2f}, p={chi2_p:.3g} | Fisher p={fisher_p if not np.isnan(fisher_p) else 'n/a'}")
     print(f"OR={or_val:.2f} [{or_lo:.2f}, {or_hi:.2f}] | RR={rr_val:.2f} [{rr_lo:.2f}, {rr_hi:.2f}]")
     if (FIGS/"fig2_km_luad_tp53.png").exists():
-        print("KM figure generated.")
+        print("KM/Cox completed (see figures/tables).")
     else:
         print("KM skipped (one group empty).")
     print("Outputs → results/figures, results/tables, docs/")

@@ -15,3 +15,4 @@ Outputs:
 - Table2: chi-square + Fisher, OR, RR (95% CI)
 - Figure1: % TP53 (95% CI bars)
 - Figure2: KM (log-rank)
+- Table3: Cox PH (if possible)
