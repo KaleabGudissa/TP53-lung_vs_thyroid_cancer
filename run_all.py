@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+"""
+End-to-end pipeline: extract cBioPortal PanCancer Atlas bundles (LUAD/THCA),
+compute TP53 mutation frequency with Wilson CIs, run LUAD survival (KM/log-rank),
+optionally fit Cox PH with minimal encoding, and write tables/figures.
+"""
+
 import tarfile, re, math
 from pathlib import Path
 import numpy as np
@@ -9,6 +15,11 @@ from lifelines import KaplanMeierFitter, CoxPHFitter
 from lifelines.statistics import logrank_test
 from scipy.stats import chi2_contingency, fisher_exact
 
+# ---- constants for clarity (no behavior change) ----
+Z_95 = 1.959963984540054   # 95% Normal quantile used in Wilson/CI formulas
+PLOTS_DPI = 300            # figure export DPI
+ERR_CAPSIZE = 6            # error bar cap size for bar chart
+
 RAW = Path("data/raw")
 PROC = Path("data/processed")
 FIGS = Path("results/figures")
@@ -17,32 +28,36 @@ DOCS = Path("docs")
 for d in [PROC, FIGS, TABLES, DOCS]:
     d.mkdir(parents=True, exist_ok=True)
 
+# Set of non-silent consequence labels used to flag TP53 mutation
 NON_SILENT = {
     "Missense_Mutation","Nonsense_Mutation","Frame_Shift_Del","Frame_Shift_Ins",
     "Splice_Site","Translation_Start_Site","Nonstop_Mutation","In_Frame_Del","In_Frame_Ins"
 }
 
 def find_tar(name_hint: str) -> Path:
+    """Return first .tar.gz in data/raw whose filename contains name_hint (case-insensitive)."""
     hits = sorted([p for p in RAW.glob("*.tar.gz") if name_hint.lower() in p.name.lower()])
     if not hits:
         raise FileNotFoundError(f"Put a *{name_hint}*.tar.gz in {RAW} (from cBioPortal Datasets).")
     return hits[0]
 
 def extract_member(tar_path: Path, patterns, out_path: Path) -> Path:
+    """Extract first archive member whose internal path matches any regex in patterns to out_path."""
     with tarfile.open(tar_path, "r:gz") as tar:
         member = None
         for patt in patterns:
             for m in tar.getmembers():
                 if re.search(patt, m.name):
-                    member = m; break
+                    member = m; break  # stop on first match
             if member: break
         if member is None:
             raise FileNotFoundError(f"No member matching {patterns} in {tar_path.name}")
-        with tar.extractfile(member) as fsrc:
+        with tar.extractfile(member) as fsrc:  # read without touching disk tree
             out_path.write_bytes(fsrc.read())
     return out_path
 
 def load_mutations(path: Path) -> pd.DataFrame:
+    """Read cBioPortal mutations table; return minimal columns and 12-char patient ID."""
     with open(path, "rt", errors="ignore") as f:
         header = f.readline().rstrip("\n").split("\t")
     need = ["Hugo_Symbol","Tumor_Sample_Barcode","Variant_Classification"]
@@ -50,15 +65,16 @@ def load_mutations(path: Path) -> pd.DataFrame:
     if len(use) < 3:
         raise ValueError(f"{path} missing required columns {need}")
     df = pd.read_csv(path, sep="\t", usecols=use, dtype=str, low_memory=False)
-    df["patient"] = df["Tumor_Sample_Barcode"].astype(str).str[:12]
+    df["patient"] = df["Tumor_Sample_Barcode"].astype(str).str[:12]  # TCGA patient key
     return df
 
 def load_cbio_patient_clin(path: Path) -> pd.DataFrame:
+    """Read cBioPortal clinical patient file; return patient_id, OS (months/event) + optional covariates."""
     rows = []
     with open(path, "rt", errors="ignore") as f:
         for line in f:
             if line.startswith("#") or not line.strip():
-                continue
+                continue  # skip comments/blank lines
             rows.append(line.rstrip("\n").split("\t"))
     if not rows:
         raise ValueError(f"{path} appears empty.")
@@ -66,6 +82,7 @@ def load_cbio_patient_clin(path: Path) -> pd.DataFrame:
     df = pd.DataFrame(data, columns=header)
 
     def to_event(x):
+        """Map OS_STATUS text to 1 (event/deceased) or 0 (censored/living)."""
         if pd.isna(x): return pd.NA
         v = str(x).upper()
         if "DECEASED" in v or v.startswith("1"): return 1
@@ -77,7 +94,7 @@ def load_cbio_patient_clin(path: Path) -> pd.DataFrame:
         "os_months": pd.to_numeric(df.get("OS_MONTHS"), errors="coerce"),
         "os_event": df.get("OS_STATUS").apply(to_event)
     })
-    # optional covariates if present
+    # Optional covariates for Cox; kept as-is and encoded later
     if "AGE" in df.columns:
         out["age"] = pd.to_numeric(df["AGE"], errors="coerce")
     if "SEX" in df.columns:
@@ -89,6 +106,7 @@ def load_cbio_patient_clin(path: Path) -> pd.DataFrame:
     return out
 
 def tp53_status(mut_df: pd.DataFrame):
+    """Return per-patient TP53 status (1 if any non-silent TP53) and the TP53 mutation rows."""
     tp = mut_df[(mut_df["Hugo_Symbol"]=="TP53") & (mut_df["Variant_Classification"].isin(NON_SILENT))].copy()
     mutated = set(tp["patient"])
     pats = mut_df["patient"].dropna().unique()
@@ -97,8 +115,9 @@ def tp53_status(mut_df: pd.DataFrame):
     return status, tp
 
 def wilson_ci(k, n):
+    """Wilson score interval (95%) for a proportion k/n; returns (low, high) as proportions."""
     if n == 0: return (np.nan, np.nan)
-    z = 1.959963984540054
+    z = Z_95
     p = k / n
     denom = 1 + z**2/n
     center = (p + z*z/(2*n)) / denom
@@ -106,30 +125,33 @@ def wilson_ci(k, n):
     return (center - half, center + half)
 
 def odds_ratio_ci(a,b,c,d):
+    """Odds ratio and 95% CI (Wald on log(OR) with Haldane–Anscombe for zeros) for 2x2 [[a,b],[c,d]]."""
     if min(a,b,c,d) == 0:
-        a+=0.5; b+=0.5; c+=0.5; d+=0.5
+        a+=0.5; b+=0.5; c+=0.5; d+=0.5  # continuity if any zero
     or_val = (a*d)/(b*c)
     se = math.sqrt(1/a + 1/b + 1/c + 1/d)
-    z = 1.959963984540054
+    z = Z_95
     lo = math.exp(math.log(or_val) - z*se)
     hi = math.exp(math.log(or_val) + z*se)
     return or_val, lo, hi
 
 def risk_ratio_ci(a,b,c,d):
+    """Risk ratio and 95% CI (Katz) for 2x2 [[a,b],[c,d]]."""
     if (a+b)==0 or (c+d)==0:
         return (np.nan, np.nan, np.nan)
     p1 = a/(a+b); p0 = c/(c+d)
     rr = p1/p0 if p0>0 else np.inf
     if min(a,b,c,d) == 0:
-        a+=0.5; b+=0.5; c+=0.5; d+=0.5
+        a+=0.5; b+=0.5; c+=0.5; d+=0.5  # continuity if any zero
     se = math.sqrt( (1/a) - (1/(a+b)) + (1/c) - (1/(c+d)) )
-    z = 1.959963984540054
+    z = Z_95
     lo = math.exp(math.log(rr) - z*se)
     hi = math.exp(math.log(rr) + z*se)
     return rr, lo, hi
 
 def main():
-    # 1) Extract needed files
+    """Pipeline entry: extract files, compute tables, make figures, KM/log-rank, Cox (encoded)."""
+    # 1) Extract needed files from each study bundle (first matching file for each pattern)
     luad_tar = find_tar("luad")
     thca_tar = find_tar("thca")
 
@@ -139,13 +161,13 @@ def main():
     luad_clin_p = extract_member(luad_tar, [r"/data_clinical_patient\.txt$", r"/data_clinical\.txt$"], PROC/"luad_data_clinical_patient.txt")
     thca_clin_p = extract_member(thca_tar, [r"/data_clinical_patient\.txt$", r"/data_clinical\.txt$"], PROC/"thca_data_clinical_patient.txt")
 
-    # 2) TP53 status per patient
+    # 2) TP53 status per patient (1 if any non-silent TP53 row)
     luad_mut = load_mutations(luad_mut_p)
     thca_mut = load_mutations(thca_mut_p)
     luad_status, luad_tp53_rows = tp53_status(luad_mut)
     thca_status, thca_tp53_rows = tp53_status(thca_mut)
 
-    # Save supplements
+    # Save supplements so readers can inspect
     luad_status.to_csv(TABLES/"luad_tp53_status.csv", index=False)
     thca_status.to_csv(TABLES/"thca_tp53_status.csv", index=False)
     luad_tp53_rows.to_csv(TABLES/"luad_tp53_rows.csv", index=False)
@@ -173,11 +195,11 @@ def main():
     # 4) Frequency tests — chi-square + Fisher + effect sizes
     a = luad_m; b = luad_n - luad_m
     c = thca_m; d = thca_n - thca_m
-    table = np.array([[a,b],[c,d]])
+    table = np.array([[a,b],[c,d]])   # 2x2: rows=cancer, cols=mut vs wt
 
     chi2, chi2_p, _, _ = chi2_contingency(table, correction=False)
     fisher_or, fisher_p = (np.nan, np.nan)
-    if (table < 5).any():
+    if (table < 5).any():             # Fisher is appropriate given tiny THCA counts
         fisher_or, fisher_p = fisher_exact(table, alternative="two-sided")
 
     or_val, or_lo, or_hi = odds_ratio_ci(a,b,c,d)
@@ -195,7 +217,7 @@ def main():
     })
     table2.to_csv(TABLES/"table2_tp53_stats.csv", index=False)
 
-    # 5) Figure 1 — % TP53 with 95% CI
+    # 5) Figure 1 — % TP53 with 95% CI (asymmetric error bars from Wilson bounds)
     xs = ["LUAD","THCA"]
     props = [100*luad_m/luad_n, 100*thca_m/thca_n]
     lows = [100*(luad_m/luad_n - luad_ci[0]), 100*(thca_m/thca_n - thca_ci[0])]
@@ -203,13 +225,13 @@ def main():
     asym_err = np.array([lows, highs])
 
     plt.figure()
-    plt.bar(xs, props, yerr=asym_err, capsize=6)
+    plt.bar(xs, props, yerr=asym_err, capsize=ERR_CAPSIZE)
     for i, v in enumerate(props):
-        plt.text(i, v, f"{v:.1f}%", ha="center", va="bottom")
+        plt.text(i, v, f"{v:.1f}%", ha="center", va="bottom")  # label bars with %
     plt.ylabel("% patients with non-silent TP53")
     plt.title("TP53 mutation frequency: LUAD vs THCA (95% CI)")
     plt.tight_layout()
-    plt.savefig(FIGS/"fig1_tp53_pct_luad_vs_thca.png", dpi=300)
+    plt.savefig(FIGS/"fig1_tp53_pct_luad_vs_thca.png", dpi=PLOTS_DPI)
     plt.savefig(FIGS/"fig1_tp53_pct_luad_vs_thca.pdf")
     plt.close()
 
@@ -217,20 +239,20 @@ def main():
     clin_luad = load_cbio_patient_clin(luad_clin_p)
     km = clin_luad.merge(luad_status, on="patient_id", how="inner")
 
-    # Ensure numeric types for lifelines
+    # Ensure numeric types for lifelines (drop rows missing survival info)
     km["os_months"] = pd.to_numeric(km["os_months"], errors="coerce")
     km["os_event"]  = pd.to_numeric(km["os_event"],  errors="coerce")
     km = km.dropna(subset=["os_months","os_event"])
     km["os_months"] = km["os_months"].astype(float)
     km["os_event"]  = km["os_event"].astype(int)
 
-    g1 = km[km["tp53_mut"]==1]
-    g0 = km[km["tp53_mut"]==0]
+    g1 = km[km["tp53_mut"]==1]   # TP53-mutated
+    g0 = km[km["tp53_mut"]==0]   # TP53 wild-type
 
     if len(g1) == 0 or len(g0) == 0:
         (TABLES/"table3_cox_summary.csv").write_text("KM/Cox skipped: one group empty.\n", encoding="utf-8")
     else:
-        # KM + log-rank
+        # Kaplan–Meier and log-rank test
         kmf0, kmf1 = KaplanMeierFitter(), KaplanMeierFitter()
         kmf0.fit(durations=g0["os_months"], event_observed=g0["os_event"], label=f"TP53 wild-type (n={len(g0)})")
         kmf1.fit(durations=g1["os_months"], event_observed=g1["os_event"], label=f"TP53 mutated (n={len(g1)})")
@@ -243,25 +265,26 @@ def main():
         ax.set_ylabel("Survival probability")
         ax.set_title(f"LUAD KM by TP53 (log-rank chi2={chi2_lr:.2f}, p={p_lr:.3g})")
         plt.tight_layout()
-        plt.savefig(FIGS/"fig2_km_luad_tp53.png", dpi=300)
+        plt.savefig(FIGS/"fig2_km_luad_tp53.png", dpi=PLOTS_DPI)
         plt.savefig(FIGS/"fig2_km_luad_tp53.pdf")
         plt.close()
 
-        # Cox PH (encode categorical covariates to numeric and fit)
+        # Cox PH (encode categorical covariates → numeric; keep minimal columns)
         try:
             cox_df = km[["os_months","os_event","tp53_mut"]].copy()
 
-            # age if present
+            # Include age if present
             if "age" in km.columns:
                 cox_df["age"] = pd.to_numeric(km["age"], errors="coerce")
 
-            # sex -> numeric (Female=0, Male=1)
+            # SEX → numeric (Female=0, Male=1)
             if "sex" in km.columns:
                 cox_df["sex_num"] = km["sex"].astype(str).str.upper().map({"FEMALE":0, "MALE":1})
 
-            # stage -> ordinal 1..4 (handles IA/IB/IIIA etc.)
+            # STAGE → ordinal 1..4 (handles IA/IB/IIIA etc.)
             if "stage" in km.columns:
                 def stage_to_num(s):
+                    """Map stage strings (I–IV with subletters) to 1..4; unknown → NaN."""
                     s = str(s).upper()
                     if "IV" in s:   return 4
                     if "III" in s:  return 3
@@ -270,7 +293,7 @@ def main():
                     return np.nan
                 cox_df["stage_num"] = km["stage"].apply(stage_to_num)
 
-            # keep only numeric columns and drop rows with NA
+            # Keep only numeric columns; drop rows with any missing covariate
             num_cols = [c for c in cox_df.columns if c not in {"sex","stage"}]
             cox_df = cox_df[num_cols].apply(pd.to_numeric, errors="coerce").dropna()
 
@@ -281,9 +304,10 @@ def main():
                 cph.fit(cox_df, duration_col="os_months", event_col="os_event")
                 cph.summary.reset_index().to_csv(TABLES/"table3_cox_summary.csv", index=False)
         except Exception as e:
+            # If anything fails, write the reason into the CSV so downstream steps still pass
             (TABLES/"table3_cox_summary.csv").write_text(f"Could not fit Cox model: {e}\n", encoding="utf-8")
 
-    # 7) Minimal provenance README (UTF-8)
+    # 7) Minimal provenance README (kept small and human-readable)
     (DOCS/"DATASET_README.txt").write_text(
 """Inputs: cBioPortal TCGA PanCancer Atlas study bundles
 - luad_tcga_pan_can_atlas_2018.tar.gz
@@ -307,7 +331,7 @@ Outputs:
         encoding="utf-8"
     )
 
-    # Console summary
+    # Console summary (quick sanity check when you run the script)
     print("\n=== SUMMARY ===")
     print(f"LUAD: {luad_m}/{luad_n} TP53-mutated ({100*luad_m/luad_n:.1f}%)")
     print(f"THCA: {thca_m}/{thca_n} TP53-mutated ({100*thca_m/thca_n:.1f}%)")
