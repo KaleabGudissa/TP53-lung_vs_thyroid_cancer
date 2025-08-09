@@ -1,0 +1,3 @@
+Cohort,Patients with mutation data (n),Patients with non-silent TP53 (n),Percent TP53 mutated (%),Wilson 95% CI (lower %),Wilson 95% CI (upper %)
+LUAD,562,287,51.1,46.9,55.2
+THCA,484,2,0.4,0.113,1.494
