@@ -15,7 +15,7 @@ from lifelines import KaplanMeierFitter, CoxPHFitter
 from lifelines.statistics import logrank_test
 from scipy.stats import chi2_contingency, fisher_exact
 
-# ---- constants for clarity (no behavior change) ----
+#constants for clarity
 Z_95 = 1.959963984540054   # 95% Normal quantile used in Wilson/CI formulas
 PLOTS_DPI = 300            # figure export DPI
 ERR_CAPSIZE = 6            # error bar cap size for bar chart
@@ -235,11 +235,11 @@ def main():
     plt.savefig(FIGS/"fig1_tp53_pct_luad_vs_thca.pdf")
     plt.close()
 
-    # 6) LUAD survival — KM + log-rank + Cox (with encoding)
+    # 6) LUAD survival — KM + log-rank + Cox
     clin_luad = load_cbio_patient_clin(luad_clin_p)
     km = clin_luad.merge(luad_status, on="patient_id", how="inner")
 
-    # Ensure numeric types for lifelines (drop rows missing survival info)
+    # Ensure numeric types for lifelines
     km["os_months"] = pd.to_numeric(km["os_months"], errors="coerce")
     km["os_event"]  = pd.to_numeric(km["os_event"],  errors="coerce")
     km = km.dropna(subset=["os_months","os_event"])
@@ -269,7 +269,7 @@ def main():
         plt.savefig(FIGS/"fig2_km_luad_tp53.pdf")
         plt.close()
 
-        # Cox PH (encode categorical covariates → numeric; keep minimal columns)
+        # Cox PH
         try:
             cox_df = km[["os_months","os_event","tp53_mut"]].copy()
 
@@ -307,7 +307,7 @@ def main():
             # If anything fails, write the reason into the CSV so downstream steps still pass
             (TABLES/"table3_cox_summary.csv").write_text(f"Could not fit Cox model: {e}\n", encoding="utf-8")
 
-    # 7) Minimal provenance README (kept small and human-readable)
+    # 7)  README 
     (DOCS/"DATASET_README.txt").write_text(
 """Inputs: cBioPortal TCGA PanCancer Atlas study bundles
 - luad_tcga_pan_can_atlas_2018.tar.gz
@@ -331,7 +331,7 @@ Outputs:
         encoding="utf-8"
     )
 
-    # Console summary (quick sanity check when you run the script)
+    # Console summary for checking
     print("\n=== SUMMARY ===")
     print(f"LUAD: {luad_m}/{luad_n} TP53-mutated ({100*luad_m/luad_n:.1f}%)")
     print(f"THCA: {thca_m}/{thca_n} TP53-mutated ({100*thca_m/thca_n:.1f}%)")
